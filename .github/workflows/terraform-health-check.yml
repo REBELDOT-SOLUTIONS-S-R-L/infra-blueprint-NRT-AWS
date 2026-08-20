@@ -1,0 +1,199 @@
+name: Operational Health Check
+
+# Scheduled, read-only runtime-health check — see ADR-0014. Distinct from Terraform Drift
+# Detect: drift detection only compares live AWS state against what Terraform declared, and
+# says nothing about whether a resource is actually healthy right now — a resource can match
+# its declared config perfectly while being operationally broken (an MSK broker that's ACTIVE
+# per config but has degraded partitions, a Flink app that's technically RUNNING but
+# crash-looping). This runs scripts/health-check.sh instead, which checks real runtime state.
+#
+# Reuses the same reviewer-free "<environment>-drift" GitHub Environment that Terraform Drift
+# Detect uses (see ADR-0011) — same unattended-cron rationale applies, and provisioning a
+# second reviewer-free environment per boundary for the identical trust posture would just be
+# more bootstrap plumbing for no real benefit. bootstrap-env.sh already sets every variable
+# this workflow needs on that environment.
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to check (or 'all')"
+        required: true
+        type: choice
+        options:
+          - all
+          - dev
+          - staging
+          - prod
+        default: all
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Scheduled runs always check every environment. Manual runs can scope to one.
+  # ---------------------------------------------------------------------------
+  determine-environments:
+    name: Determine environments to check
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.set.outputs.environments }}
+    steps:
+      - id: set
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.environment }}" == "all" ]]; then
+            echo 'environments=["dev","staging","prod"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'environments=["${{ inputs.environment }}"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Read-only checks against live AWS resources, no apply/change of any kind. Fails the run
+  # (and files/updates a tracking issue) when something's unhealthy, so an unattended cron run
+  # still produces a visible, durable signal instead of output nobody happens to read.
+  # ---------------------------------------------------------------------------
+  health-check:
+    name: Health Check (${{ matrix.environment }})
+    needs: determine-environments
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.determine-environments.outputs.environments) }}
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}-drift
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ matrix.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
+            -backend-config="kms_key_id=${{ vars.TF_STATE_KMS_KEY_ARN }}"
+
+      - name: Run operational health check
+        id: healthcheck
+        run: |
+          set +e
+          ../../scripts/health-check.sh 2>&1 | tee health-check-output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Post health check to step summary
+        if: always()
+        env:
+          MATRIX_ENVIRONMENT: ${{ matrix.environment }}
+          EXIT_CODE: ${{ steps.healthcheck.outputs.exit_code }}
+        run: |
+          if [[ "${EXIT_CODE}" == "0" ]]; then
+            ICON="✅"; TITLE="Healthy"
+          elif [[ "${EXIT_CODE}" == "2" ]]; then
+            ICON="⬜"; TITLE="Empty — no resources in state (not deployed, or destroyed)"
+          else
+            ICON="❌"; TITLE="Unhealthy"
+          fi
+          {
+            echo "## ${ICON} Health Check: \`${MATRIX_ENVIRONMENT}\` — ${TITLE}"
+            echo ""
+            echo "> Read-only check against live AWS resources. Nothing has been created or changed."
+            echo ""
+            echo "<details><summary>Show output</summary>"
+            echo ""
+            echo '```'
+            cat health-check-output.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update health issue
+        # Only a real check failure (exit 1) files an issue. Exit 2 (empty state — nothing
+        # deployed, e.g. destroyed since the last run) isn't "unhealthy", it's "not there" —
+        # see scripts/health-check.sh's exit-code doc comment.
+        if: steps.healthcheck.outputs.exit_code == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX_ENVIRONMENT: ${{ matrix.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Health check failed: ${MATRIX_ENVIRONMENT}"
+          body_file=$(mktemp)
+          {
+            echo "Scheduled operational health check found unhealthy resource(s) in"
+            echo "\`environments/${MATRIX_ENVIRONMENT}\`."
+            echo ""
+            echo "Run: ${RUN_URL}"
+            echo ""
+            echo '```'
+            cat health-check-output.txt
+            echo '```'
+          } > "${body_file}"
+
+          existing=$(gh issue list --repo "${{ github.repository }}" --label health --state open \
+            --search "in:title \"${title}\"" --json number --jq '.[0].number')
+
+          if [[ -n "${existing}" ]]; then
+            gh issue edit "${existing}" --repo "${{ github.repository }}" --body-file "${body_file}"
+            gh issue comment "${existing}" --repo "${{ github.repository }}" \
+              --body "Still unhealthy as of ${RUN_URL}."
+          else
+            gh issue create --repo "${{ github.repository }}" --title "${title}" \
+              --label health --body-file "${body_file}"
+          fi
+
+      - name: Close health issue if resolved
+        # Closes on exit 0 (healthy again) or exit 2 (state now empty — e.g. the environment
+        # was destroyed since the issue was filed). Either way the resource the issue was
+        # about is no longer unhealthy; only exit 1 keeps the issue open.
+        if: steps.healthcheck.outputs.exit_code != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX_ENVIRONMENT: ${{ matrix.environment }}
+          EXIT_CODE: ${{ steps.healthcheck.outputs.exit_code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Health check failed: ${MATRIX_ENVIRONMENT}"
+          existing=$(gh issue list --repo "${{ github.repository }}" --label health --state open \
+            --search "in:title \"${title}\"" --json number --jq '.[0].number')
+
+          if [[ -n "${existing}" ]]; then
+            if [[ "${EXIT_CODE}" == "2" ]]; then
+              resolution="Terraform state is now empty (no resources) — closing as ${RUN_URL}."
+            else
+              resolution="Resolved — healthy as of ${RUN_URL}."
+            fi
+            gh issue comment "${existing}" --repo "${{ github.repository }}" --body "${resolution}"
+            gh issue close "${existing}" --repo "${{ github.repository }}"
+          fi
+
+      - name: Fail if unhealthy
+        # Exit 2 (empty state) does not fail the job — it's not a broken check, just nothing
+        # to check. Only a real failure (exit 1) should fail the scheduled run.
+        if: steps.healthcheck.outputs.exit_code == '1'
+        run: |
+          echo "Unhealthy resources detected in ${{ matrix.environment }} — see step summary / tracking issue."
+          exit 1

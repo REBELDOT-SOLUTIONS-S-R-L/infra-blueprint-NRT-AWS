@@ -1,0 +1,341 @@
+# Copy this file to terraform.tfvars (gitignored, never committed) and fill in real values
+# before running `terraform plan`/`apply` locally. The values below are EXAMPLES to show the
+# expected shape/format — not real defaults, and not safe to apply as-is. Real CI/CD applies
+# don't read this file at all (see docs/deployment.md) — it's for local sanity checks and as
+# a template for the GitHub Environment variables that CI actually uses.
+
+# ---------------------------------------------------------------------------
+# Region & environment identity
+# ---------------------------------------------------------------------------
+
+# The AWS region this environment's infrastructure lives in. All resources (VPCs, MSK, Flink,
+# S3, etc.) get created here — one region per environment, no multi-region in this design yet.
+# Example: "us-east-1"
+aws_region = "us-east-1"
+
+# Which environment this is. Must match the folder name (dev/staging/prod) — used purely for
+# tagging/labeling resources so you can tell them apart in the AWS console/cost reports; it
+# doesn't switch behavior on its own.
+# Example: "dev"
+environment = "prod"
+
+# ---------------------------------------------------------------------------
+# Mandatory tags (see global/tagging-policy.tf) — applied to every resource this repo creates.
+# Ask whoever owns cloud cost/governance at the organization for the real values; never guess these.
+# ---------------------------------------------------------------------------
+
+# Which internal cost center/budget code to bill this environment's AWS spend against.
+# Example: "CC-10294-DATAENG"
+cost_center = "REPLACE-ME"
+
+# The organization's data sensitivity classification for what flows through this platform (drives
+# handling/audit requirements downstream — ask the data governance team for the exact label
+# they use).
+# Example: "confidential-pci"
+data_classification = "REPLACE-ME"
+
+# Person or team accountable for this environment — who to page/email if something's wrong
+# with it.
+# Example: "nrt-platform-team@org.example.com"
+owner = "REPLACE-ME"
+
+# The organization's retention/records-management policy tag this environment falls under (separate
+# from the technical 7-day ODS TTL in modules/lakehouse — this is the compliance-facing label).
+# Example: "standard-7y"
+retention_policy = "REPLACE-ME"
+
+# ---------------------------------------------------------------------------
+# Boundary account role ARNs (see docs/architecture-decisions/0001)
+# ---------------------------------------------------------------------------
+# Leave all four commented out for a single-account PoC — every boundary then deploys using
+# whatever AWS credentials you're already authenticated with locally (or the OIDC role CI
+# assumes). Uncomment and fill in only once the organization has actually provisioned the 4 separate
+# landing-zone accounts (network/integration/nrt-processing/data) — don't invent account IDs
+# to fill these in early, that produces a plan that can never really apply.
+
+# IAM role in the "network" boundary account (TGW hub, DX/VPN) that Terraform assumes to
+# deploy there.
+# Example: "arn:aws:iam::111122223333:role/terraform-deploy"
+# network_account_role_arn = "arn:aws:iam::<NETWORK_ACCOUNT_ID>:role/terraform-deploy"
+
+# IAM role in the "integration" boundary account (MSK cluster + MSK Connect) that Terraform
+# assumes to deploy there.
+# Example: "arn:aws:iam::222233334444:role/terraform-deploy"
+# integration_account_role_arn = "arn:aws:iam::<INTEGRATION_ACCOUNT_ID>:role/terraform-deploy"
+
+# IAM role in the "nrt-processing" boundary account (Flink, Lambda, Redis) that Terraform
+# assumes to deploy there.
+# Example: "arn:aws:iam::333344445555:role/terraform-deploy"
+# nrt_processing_account_role_arn = "arn:aws:iam::<NRT_PROCESSING_ACCOUNT_ID>:role/terraform-deploy"
+
+# IAM role in the "data" boundary account (S3/Iceberg/Glue/Athena) that Terraform assumes to
+# deploy there.
+# Example: "arn:aws:iam::444455556666:role/terraform-deploy"
+# data_account_role_arn = "arn:aws:iam::<DATA_ACCOUNT_ID>:role/terraform-deploy"
+
+# ---------------------------------------------------------------------------
+# VPC CIDRs (see docs/architecture-decisions/0004)
+# ---------------------------------------------------------------------------
+# The values below use RFC 5737 "documentation" ranges (192.0.2.0/24, 198.51.100.0/24,
+# 203.0.113.0/24) — these are reserved by IANA specifically so they're never real/routable
+# addresses, safe to show as examples without risk of colliding with anything. Get real,
+# non-overlapping ranges from the organization's network/IPAM team before an actual apply — they need
+# to not collide with each other, with on-prem, or with any other AWS account the organization already
+# routes to over Direct Connect/VPN.
+
+# VPC CIDR for the "network" boundary's own shared-services VPC (DNS resolver endpoints,
+# centralized flow logs). Needs to be big enough for a couple of small subnets, nothing more —
+# no application workloads run here.
+# Example: "10.0.0.0/25" (128 addresses)
+network_shared_vpc_cidr = "192.0.2.0/25"
+
+# Private subnet CIDRs inside the network-shared VPC above, one per AZ (2 AZs = high
+# availability for the DNS resolver endpoints).
+# Example: ["10.0.0.0/26", "10.0.0.64/26"]
+network_shared_private_subnet_cidrs = ["192.0.2.0/26", "192.0.2.64/26"]
+
+# VPC CIDR for the "integration" boundary — where the MSK cluster and the ~2,000 app adapter
+# connectors live. This is the on-prem-facing edge, so size it with room for MSK broker ENIs
+# across AZs plus headroom for connector scale-out.
+# Example: "10.0.1.0/24" (256 addresses)
+integration_vpc_cidr = "192.0.2.128/25"
+
+# Private subnet CIDRs inside the integration VPC, one per AZ.
+# Example: ["10.0.1.0/26", "10.0.1.64/26"]
+integration_private_subnet_cidrs = ["192.0.2.128/26", "192.0.2.192/26"]
+
+# VPC CIDR for the "nrt-processing" boundary — Flink (EMR/Managed Service), VPC-attached
+# Lambda, and ElastiCache Redis all run here.
+# Example: "10.0.2.0/24"
+nrt_processing_vpc_cidr = "198.51.100.0/24"
+
+# Private subnet CIDRs inside the nrt-processing VPC, one per AZ.
+# Example: ["10.0.2.0/26", "10.0.2.64/26"]
+nrt_processing_private_subnet_cidrs = ["198.51.100.0/26", "198.51.100.64/26"]
+
+# VPC CIDR for the "data" boundary. Mostly managed/regional services (S3, Glue, Athena) rather
+# than VPC-resident workloads — this VPC exists so those services can be reached over private
+# endpoints instead of the public internet.
+# Example: "10.0.3.0/24"
+data_vpc_cidr = "203.0.113.0/24"
+
+# Private subnet CIDRs inside the data VPC, one per AZ.
+# Example: ["10.0.3.0/26", "10.0.3.64/26"]
+data_private_subnet_cidrs = ["203.0.113.0/26", "203.0.113.64/26"]
+
+# ---------------------------------------------------------------------------
+# On-prem connectivity edge (see docs/architecture-decisions/0003)
+# ---------------------------------------------------------------------------
+# Leave both flags false/disabled until the organization's network team has actually provisioned a
+# real circuit — a half-configured DX/VPN attachment with fake values doesn't do anything
+# useful and just adds confusing partial state.
+
+# Whether to provision a Direct Connect Gateway + TGW association in the network boundary.
+# This is the "real" production-grade on-prem link — a physical circuit the organization's network
+# team sets up, not something Terraform can create end-to-end on its own.
+# Default false is fine until DX is actually ordered/provisioned.
+enable_dx = false
+
+# Amazon-side BGP ASN for the DX Gateway. Only required once enable_dx = true.
+# Example: 64512 (a private-use ASN — ask the network team which range the organization standardizes on)
+# dx_gateway_amazon_side_asn = 64512
+
+# On-prem CIDR prefixes allowed to route over the DX Gateway association — i.e. which on-prem
+# subnets are allowed to talk to AWS through this link. Only required once enable_dx = true.
+# Example: ["10.100.0.0/16"]
+# dx_allowed_prefixes = ["10.100.0.0/16"]
+
+# ID of an already-provisioned physical Direct Connect connection (created outside Terraform,
+# by AWS/the organization's network team, via a support ticket/console). Leave unset until that
+# physical circuit exists — Terraform can't create the physical connection itself.
+# Example: "dxcon-fguhmqlc"
+# dx_connection_id = "dxcon-fguhmqlc"
+
+# VLAN tag for the DX transit virtual interface — assigned by whoever configures the physical
+# circuit. Only required once dx_connection_id is set.
+# Example: 4094
+# dx_vlan = 4094
+
+# Customer(on-prem)-side BGP ASN for the DX transit virtual interface. Only required once
+# dx_connection_id is set.
+# Example: 65000
+# dx_bgp_asn = 65000
+
+# Whether to provision a Customer Gateway + TGW-attached VPN connection — a quicker,
+# lower-throughput fallback/interim on-prem link compared to Direct Connect (useful before DX
+# is physically installed).
+# Default false is fine until a VPN tunnel is actually needed.
+enable_vpn = false
+
+# Public IP address of the on-prem VPN device the tunnel terminates on. Only required once
+# enable_vpn = true.
+# Example: "203.0.113.42"
+# customer_gateway_ip = "203.0.113.42"
+
+# BGP ASN of that on-prem VPN device. Only required once enable_vpn = true.
+# Example: 65000
+# customer_gateway_bgp_asn = 65000
+
+# ---------------------------------------------------------------------------
+# KMS (see global/kms)
+# ---------------------------------------------------------------------------
+
+# Whether to provision global/kms's per-service CMKs at all. false (this platform's current
+# setting in all three environments, as of ADR-0015) skips global/kms entirely and leaves
+# every service on its own plain AWS-managed encryption — no other tfvars change needed. This
+# was turned off after an Organizations SCP was found blocking CMK-backed CloudWatch Logs log
+# groups outright, even for account admins, at PoC stage. Flip to true once that's resolved
+# (or once this environment holds real customer/transaction data and ARCHITECTURE.md's "no default
+# AWS-managed keys" convention should bind again) — kms_admin_role_arns below only matters
+# once this is true.
+# Example: false
+enable_customer_managed_keys = false
+
+# IAM role ARN(s) allowed to administer this environment's customer-managed KMS keys —
+# rotate them, change their key policy, schedule/cancel deletion. This should be a
+# platform-admin or break-glass role, not the same roles that just use the keys day to day
+# (Flink/Lambda execution roles get separate, narrower "use this key" grants automatically).
+# Only used when enable_customer_managed_keys = true above; defaults to [] otherwise, so this
+# can stay commented out until then. bootstrap/ provisions this role for you
+# (aws_iam_role.kms_key_administrator, an MFA-gated, break-glass-tier role — see ADR-0013) —
+# scripts/bootstrap-env.sh prints its ARN and sets it as CI's KMS_ADMIN_ROLE_ARNS GitHub
+# Environment variable automatically. This tfvars value is only for a *local* plan/apply; get
+# the real ARN via:
+#   terraform -chdir=bootstrap output -state=state/<env>.tfstate -raw kms_admin_role_arn
+# Never invent a value here. In staging/prod, also confirm KMS_ADMIN_TRUSTED_PRINCIPAL_ARNS
+# (bootstrap's input, not this one) names the organization's actual security/governance-team identity —
+# see docs/deployment.md's KMS admin role section.
+# Example: ["arn:aws:iam::111122223333:role/dev-nrt-platform-kms-key-admin-breakglass"]
+# kms_admin_role_arns = ["REPLACE-ME"]
+
+# ---------------------------------------------------------------------------
+# MSK (see docs/architecture-decisions/0002)
+# ---------------------------------------------------------------------------
+
+# Apache Kafka version for the MSK cluster. Confirm against AWS's currently-supported MSK
+# Kafka versions before applying — this isn't guaranteed to still be supported by the time
+# you read this.
+# Example: "3.9.x"
+msk_kafka_version = "3.9.x"
+
+# Total broker count across all integration-boundary private subnets — must be a whole
+# multiple of how many subnets integration_private_subnet_cidrs has above (2 subnets => 2, 4,
+# 6... brokers). Size prod for the real ~2,000-adapter throughput, not this starting default.
+# Example: 4
+msk_number_of_broker_nodes = 4
+
+# Broker EC2 instance type. Size for real throughput once the ~2,000 adapters' actual load
+# profile is known — don't leave prod on the same small default used for dev/staging.
+# Example: "kafka.m5.large"
+msk_broker_instance_type = "kafka.m5.large"
+
+# Per-broker EBS volume size (GiB) for Kafka log storage.
+# Example: 100
+msk_broker_ebs_volume_size = 100
+
+# ---------------------------------------------------------------------------
+# Schema Registry (see docs/architecture-decisions/0006)
+# ---------------------------------------------------------------------------
+# Empty until data engineering has real, reviewed per-topic event schemas
+# (docs/data-contracts/) to register — see modules/schema-registry's `schemas` variable for
+# the full object shape once you're ready to populate this.
+
+# Example: {} (no schemas registered yet)
+schema_registry_schemas = {}
+
+# ---------------------------------------------------------------------------
+# MSK Connect (see docs/architecture-decisions/0002)
+# ---------------------------------------------------------------------------
+# Empty until data engineering has real, reviewed connector artifacts (JARs/ZIPs, uploaded to
+# S3) and per-adapter configs for the ~2,000 app adapters — see modules/msk-connect's
+# `custom_plugins`/`connectors` variables for the full object shapes once you're ready to
+# populate these.
+
+# Example: {} (no connector plugins uploaded yet)
+msk_connect_custom_plugins = {}
+
+# Example: {} (no connectors configured yet)
+msk_connect_connectors = {}
+
+# ---------------------------------------------------------------------------
+# Flink (see docs/architecture-decisions/0005)
+# ---------------------------------------------------------------------------
+# The JAR referenced below must already exist in S3 before applying — AWS validates the
+# object exists when creating the Managed Service for Apache Flink application. Ask whoever
+# owns the deploy pipeline (or upload a placeholder no-op JAR yourself) before the first apply.
+
+# S3 bucket ARN holding the Flink application JAR.
+# Example: "arn:aws:s3:::org-nrt-platform-prod-flink-jobs"
+flink_application_jar_s3_bucket_arn = "REPLACE-ME"
+
+# S3 object key of the JAR within that bucket. Point this at a placeholder no-op JAR until
+# data engineering has a real job to deploy — but confirm prod actually has a reviewed job
+# before applying here, not just the bootstrap placeholder.
+# Example: "flink-jobs/bootstrap-noop.jar"
+flink_application_jar_s3_key = "flink-jobs/bootstrap-noop.jar"
+
+# Flink application parallelism (parallel task slots). Size for real prod throughput —
+# Managed Service for Apache Flink can auto-scale from here, but start from a realistic floor.
+# Example: 2
+flink_parallelism = 2
+
+# ---------------------------------------------------------------------------
+# Lambda
+# ---------------------------------------------------------------------------
+# Empty until data engineering has real, reviewed deployment packages (validation/dedup/
+# routing micro-transforms) to point at — see modules/lambda's variables.tf for the full
+# object shape once you're ready to populate this.
+# Example: {} (no functions defined yet)
+lambda_functions = {}
+
+# ---------------------------------------------------------------------------
+# ElastiCache (Redis)
+# ---------------------------------------------------------------------------
+
+# Redis node instance type. Size for real prod hot-state volume — don't leave prod on the
+# same starting default used for dev/staging without checking.
+# Example: "cache.r7g.large"
+redis_node_type = "cache.r7g.large"
+
+# Number of Redis nodes (primary + replicas). 2 is the minimum for automatic failover; prod
+# may want more replicas for read scaling.
+# Example: 2
+redis_num_cache_clusters = 2
+
+# ---------------------------------------------------------------------------
+# Notifications (SNS/SES)
+# ---------------------------------------------------------------------------
+# Empty/unset until real notification channels and the organization's sending domain are confirmed —
+# see modules/notifications' variables.tf for the full shape once you're ready to populate this.
+
+# Example: {} (no topics defined yet)
+sns_topics = {}
+
+# Verified SES sending domain. Leave commented out until the organization confirms a real domain —
+# don't invent one, an unverified/fake domain can't actually send email anyway.
+# Example: "notifications.org.example.com"
+# ses_domain = "notifications.org.example.com"
+
+# ---------------------------------------------------------------------------
+# Lakehouse (see docs/architecture-decisions/0007, 0012)
+# ---------------------------------------------------------------------------
+
+# Globally-unique S3 bucket name for this environment's lakehouse — S3 bucket names are
+# global across all of AWS, so this needs a real, unique name per environment (dev/staging/
+# prod each need their own). Ask whoever owns naming conventions at the organization.
+# Example: "org-nrt-platform-prod-ods"
+lakehouse_bucket_name = "REPLACE-ME"
+
+# How many days general-audit ODS data is retained before automatic deletion (see ADR-0007 —
+# this is a cost-driven default, not a regulatory floor; raise it once a real retention need
+# is known). Confirm with compliance whether prod needs a longer value than dev/staging.
+# Example: 7
+ods_retention_days = 7
+
+# Whether to provision the decision-audit tier (see ADR-0012). Keep false until that ADR
+# actually resolves to Option 3 (decisioning logic hosted in this repo's Flink/Lambda) — see
+# ARCHITECTURE.md's Open Decisions section and ADR-0012 for the full context. This isn't a knob to
+# flip experimentally; it tracks a real, pending business/compliance decision, and prod is the
+# last place to guess on it.
+# Example: false
+enable_decisioning_in_platform = false

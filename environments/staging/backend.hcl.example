@@ -1,0 +1,14 @@
+# Copy to backend.hcl (gitignored) and fill in with bootstrap/'s outputs for this account:
+#   cd bootstrap && terraform output state_bucket_name && terraform output state_kms_key_arn
+#
+# Used via: terraform init -backend-config=backend.hcl
+# (CI doesn't use this file — it passes the same values as -backend-config key=value flags
+# sourced from GitHub Environment variables, since gitignored files aren't present on the
+# runner. See docs/deployment.md.)
+
+bucket       = "staging-nrt-platform-tfstate-<ACCOUNT_ID>" # from: terraform output state_bucket_name
+key          = "staging/terraform.tfstate"
+region       = "us-east-1"
+use_lockfile = true
+encrypt      = true
+kms_key_id   = "<KMS_KEY_ARN>" # from: terraform output state_kms_key_arn

@@ -1,0 +1,349 @@
+name: Terraform Drift Detect
+
+# Scheduled, read-only drift check — see ADR-0011. Runs a real, authenticated `terraform
+# plan` against each environment's live state, on a cron, and never applies anything.
+#
+# Deliberately does NOT reuse the "<environment>" GitHub Environment that terraform-plan.yml
+# / terraform-apply.yml use: that environment can carry required reviewers (ADR-0009), and a
+# scheduled run has nobody present to approve — it would just stall forever. Instead this
+# authenticates via a separate "<environment>-drift" GitHub Environment that
+# scripts/bootstrap-env.sh creates alongside the main one, always reviewer-free, sharing the
+# same deploy role (bootstrap/'s trust policy lists both subjects).
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to check (or 'all')"
+        required: true
+        type: choice
+        options:
+          - all
+          - dev
+          - staging
+          - prod
+        default: all
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Scheduled runs always check every environment. Manual runs can scope to one.
+  # ---------------------------------------------------------------------------
+  determine-environments:
+    name: Determine environments to check
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.set.outputs.environments }}
+    steps:
+      - id: set
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.environment }}" == "all" ]]; then
+            echo 'environments=["dev","staging","prod"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'environments=["${{ inputs.environment }}"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Real plan against live AWS state, no apply. Fails the run (and files/updates a
+  # tracking issue) when drift is found, so an unattended cron run still produces a
+  # visible, durable signal instead of a plan output nobody happens to read.
+  # ---------------------------------------------------------------------------
+  drift-check:
+    name: Drift Check (${{ matrix.environment }})
+    needs: determine-environments
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.determine-environments.outputs.environments) }}
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}-drift
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ matrix.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
+            -backend-config="kms_key_id=${{ vars.TF_STATE_KMS_KEY_ARN }}"
+
+      - name: Terraform Plan (detect drift)
+        id: plan
+        # hashicorp/setup-terraform's wrapper (terraform_wrapper: true, the default — see the
+        # setup-terraform step above) intercepts every `terraform` call for the rest of this
+        # job and masks the real exit code at the shell level: both PIPESTATUS[0] off a piped
+        # `tee` and a direct $? were observed, empirically, to read 0 for a `-detailed-exitcode`
+        # plan that clearly found changes (exit code 2 — the plan text showed real diffs).
+        # This is a documented behavior of the wrapper, not a bug in this script: the real code
+        # is exposed separately as steps.plan.outputs.exitcode, which every step below reads
+        # instead. continue-on-error keeps this step itself from being marked failed before
+        # those later steps get to inspect that code and decide pass/fail on their own.
+        continue-on-error: true
+        run: |
+          terraform plan -no-color -detailed-exitcode | tee plan-output.txt
+        env:
+          # None of these are secret (CIDRs, tags, region) — all sourced from this
+          # environment's GitHub Environment variables, never repo-level.
+          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+          TF_VAR_environment: ${{ matrix.environment }}
+          TF_VAR_cost_center: ${{ vars.COST_CENTER }}
+          TF_VAR_data_classification: ${{ vars.DATA_CLASSIFICATION }}
+          TF_VAR_owner: ${{ vars.OWNER }}
+          TF_VAR_retention_policy: ${{ vars.RETENTION_POLICY }}
+          # JSON list of role ARN(s) allowed to administer this platform's KMS CMKs (rotate,
+          # rewrite key policy, schedule/cancel deletion) — set by bootstrap-env.sh from
+          # bootstrap/'s kms_admin_role_arn output. See ADR-0013 and docs/deployment.md.
+          # || '[]' matches the variable's own Terraform default (variables.tf) — needed
+          # because an unset GitHub Environment variable resolves to "" here, and Terraform
+          # fails trying to HCL-parse an empty string as a list(string), not "use the default".
+          TF_VAR_kms_admin_role_arns: ${{ vars.KMS_ADMIN_ROLE_ARNS || '[]' }}
+          TF_VAR_network_shared_vpc_cidr: ${{ vars.NETWORK_SHARED_VPC_CIDR }}
+          TF_VAR_network_shared_private_subnet_cidrs: ${{ vars.NETWORK_SHARED_PRIVATE_SUBNET_CIDRS }}
+          TF_VAR_integration_vpc_cidr: ${{ vars.INTEGRATION_VPC_CIDR }}
+          TF_VAR_integration_private_subnet_cidrs: ${{ vars.INTEGRATION_PRIVATE_SUBNET_CIDRS }}
+          TF_VAR_nrt_processing_vpc_cidr: ${{ vars.NRT_PROCESSING_VPC_CIDR }}
+          TF_VAR_nrt_processing_private_subnet_cidrs: ${{ vars.NRT_PROCESSING_PRIVATE_SUBNET_CIDRS }}
+          TF_VAR_data_vpc_cidr: ${{ vars.DATA_VPC_CIDR }}
+          TF_VAR_data_private_subnet_cidrs: ${{ vars.DATA_PRIVATE_SUBNET_CIDRS }}
+          # On-prem connectivity stays disabled until a real DX/VPN circuit exists —
+          # flip these on (and add the matching dx_*/customer_gateway_* TF_VAR_ entries)
+          # once one does.
+          TF_VAR_enable_dx: "false"
+          TF_VAR_enable_vpn: "false"
+          # MSK/Flink/Redis/lakehouse sizing — || falls back to the same default already in
+          # variables.tf, so this stays safe even if bootstrap-env.sh hasn't been rerun since
+          # these were added (an unset GitHub Environment variable resolves to "" here, which
+          # would otherwise flow through as an explicit empty string, not "use the default").
+          TF_VAR_msk_kafka_version: ${{ vars.MSK_KAFKA_VERSION || '3.9.x' }}
+          TF_VAR_msk_number_of_broker_nodes: ${{ vars.MSK_NUMBER_OF_BROKER_NODES || '4' }}
+          TF_VAR_msk_broker_instance_type: ${{ vars.MSK_BROKER_INSTANCE_TYPE || 'kafka.m5.large' }}
+          TF_VAR_msk_broker_ebs_volume_size: ${{ vars.MSK_BROKER_EBS_VOLUME_SIZE || '100' }}
+          TF_VAR_flink_application_jar_s3_key: ${{ vars.FLINK_APPLICATION_JAR_S3_KEY || 'flink-jobs/bootstrap-noop.jar' }}
+          TF_VAR_flink_parallelism: ${{ vars.FLINK_PARALLELISM || '2' }}
+          TF_VAR_redis_node_type: ${{ vars.REDIS_NODE_TYPE || 'cache.r7g.large' }}
+          TF_VAR_redis_num_cache_clusters: ${{ vars.REDIS_NUM_CACHE_CLUSTERS || '2' }}
+          TF_VAR_ods_retention_days: ${{ vars.ODS_RETENTION_DAYS || '7' }}
+          TF_VAR_enable_decisioning_in_platform: ${{ vars.ENABLE_DECISIONING_IN_PLATFORM || 'false' }}
+          TF_VAR_ses_domain: ${{ vars.SES_DOMAIN }}
+          # No sensible fallback for these two — a real, unique bucket name and a real JAR
+          # location can't be invented. Left unset, Terraform will fail loudly rather than
+          # silently apply against a placeholder value (see modules/lakehouse, modules/flink-emr).
+          TF_VAR_lakehouse_bucket_name: ${{ vars.LAKEHOUSE_BUCKET_NAME }}
+          TF_VAR_flink_application_jar_s3_bucket_arn: ${{ vars.FLINK_APPLICATION_JAR_S3_BUCKET_ARN }}
+
+      - name: Post plan to step summary
+        if: always()
+        env:
+          MATRIX_ENVIRONMENT: ${{ matrix.environment }}
+          EXIT_CODE: ${{ steps.plan.outputs.exitcode }}
+        run: |
+          if [[ "${EXIT_CODE}" == "0" ]]; then
+            ICON="✅"; TITLE="No drift"
+          elif [[ "${EXIT_CODE}" == "2" ]]; then
+            ICON="⚠️"; TITLE="Drift detected"
+          elif [[ "${EXIT_CODE}" == "1" ]]; then
+            ICON="❌"; TITLE="Plan errored (not drift — see issue)"
+          else
+            ICON="❌"; TITLE="Setup failed — plan never ran (see issue)"
+          fi
+          {
+            echo "## ${ICON} Drift Check: \`${MATRIX_ENVIRONMENT}\` — ${TITLE}"
+            echo ""
+            echo "> This is a read-only check. Nothing has been created or changed in AWS."
+            echo ""
+            if [[ -f plan-output.txt ]]; then
+              echo "<details><summary>Show plan</summary>"
+              echo ""
+              echo '```hcl'
+              cat plan-output.txt
+              echo '```'
+              echo "</details>"
+            else
+              echo "\`terraform plan\` never ran — an earlier step (checkout, AWS auth, or"
+              echo "\`terraform init\`) failed first. See that step's log above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------------
+      # Real drift (exit code 2): plan succeeded and found a genuine diff between state
+      # and live AWS. Tracked separately from check-failure issues below — this is the
+      # signal this workflow exists to surface.
+      # ---------------------------------------------------------------------------
+      - name: Open or update drift issue
+        if: steps.plan.outputs.exitcode == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX_ENVIRONMENT: ${{ matrix.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # GitHub issue bodies cap at 65536 characters (gh issue create/edit errors with
+          # "Body is too long" past that) — a plan with many resources (e.g. a never-applied
+          # environment) easily exceeds it. Keep the tail: that's where the `Plan:` summary
+          # and Changes to Outputs live, the actionable part; the full plan is always in this
+          # run's step summary regardless.
+          max_plan_chars=55000
+          title="Drift detected: ${MATRIX_ENVIRONMENT}"
+          body_file=$(mktemp)
+          {
+            echo "Scheduled drift check found undeclared changes between Terraform state and"
+            echo "live AWS resources for \`environments/${MATRIX_ENVIRONMENT}\`."
+            echo ""
+            echo "Run: ${RUN_URL}"
+            echo ""
+            echo '```hcl'
+            if [[ "$(wc -c < plan-output.txt)" -gt "${max_plan_chars}" ]]; then
+              echo "(truncated — showing the end of the plan; full plan is in the run's step summary)"
+              echo ""
+              tail -c "${max_plan_chars}" plan-output.txt
+            else
+              cat plan-output.txt
+            fi
+            echo '```'
+          } > "${body_file}"
+
+          existing=$(gh issue list --repo "${{ github.repository }}" --label drift --state open \
+            --search "in:title \"${title}\"" --json number --jq '.[0].number')
+
+          if [[ -n "${existing}" ]]; then
+            gh issue edit "${existing}" --repo "${{ github.repository }}" --body-file "${body_file}"
+            gh issue comment "${existing}" --repo "${{ github.repository }}" \
+              --body "Drift still present as of ${RUN_URL}."
+          else
+            gh issue create --repo "${{ github.repository }}" --title "${title}" \
+              --label drift --body-file "${body_file}"
+          fi
+
+      - name: Close drift issue if resolved
+        if: steps.plan.outputs.exitcode == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX_ENVIRONMENT: ${{ matrix.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Drift detected: ${MATRIX_ENVIRONMENT}"
+          existing=$(gh issue list --repo "${{ github.repository }}" --label drift --state open \
+            --search "in:title \"${title}\"" --json number --jq '.[0].number')
+
+          if [[ -n "${existing}" ]]; then
+            gh issue comment "${existing}" --repo "${{ github.repository }}" \
+              --body "Resolved — no drift found as of ${RUN_URL}."
+            gh issue close "${existing}" --repo "${{ github.repository }}"
+          fi
+
+      # ---------------------------------------------------------------------------
+      # Check failure (plan errored, or never ran at all): distinct from real drift above.
+      # A bad TF_VAR_*, a config error, or a broken AWS auth/init step means this
+      # environment has NOT been verified for drift either way — that's a problem with
+      # the checker itself (or its environment's config), and belongs to whoever
+      # maintains this workflow/environment, not necessarily whoever owns the infra. See
+      # ADR-0011 amendment.
+      # ---------------------------------------------------------------------------
+      - name: Open or update drift-check-error issue
+        if: always() && (steps.plan.outputs.exitcode == '1' || steps.plan.outcome == 'skipped')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX_ENVIRONMENT: ${{ matrix.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        run: |
+          # See the "Open or update drift issue" step above for why this is truncated —
+          # GitHub issue bodies cap at 65536 characters.
+          max_plan_chars=55000
+          title="Drift check failed: ${MATRIX_ENVIRONMENT}"
+          body_file=$(mktemp)
+          {
+            if [[ "${PLAN_OUTCOME}" == "skipped" ]]; then
+              echo "The scheduled drift check for \`environments/${MATRIX_ENVIRONMENT}\` could not"
+              echo "run \`terraform plan\` at all — a setup step (checkout, AWS auth, or"
+              echo "\`terraform init\`) failed first. This environment has NOT been verified for"
+              echo "drift; fix the setup step before trusting any prior clean/drift result."
+            else
+              echo "The scheduled drift check for \`environments/${MATRIX_ENVIRONMENT}\` ran"
+              echo "\`terraform plan\` but it errored (exit code 1) instead of completing —"
+              echo "commonly a bad or missing \`TF_VAR_*\` value or a config error, not real AWS"
+              echo "drift. This environment has NOT been verified for drift until this is fixed."
+            fi
+            echo ""
+            echo "Run: ${RUN_URL}"
+            echo ""
+            if [[ -f plan-output.txt ]]; then
+              echo '```hcl'
+              if [[ "$(wc -c < plan-output.txt)" -gt "${max_plan_chars}" ]]; then
+                echo "(truncated — showing the end of the plan; full plan is in the run's step summary)"
+                echo ""
+                tail -c "${max_plan_chars}" plan-output.txt
+              else
+                cat plan-output.txt
+              fi
+              echo '```'
+            fi
+          } > "${body_file}"
+
+          existing=$(gh issue list --repo "${{ github.repository }}" --label drift-check-error --state open \
+            --search "in:title \"${title}\"" --json number --jq '.[0].number')
+
+          if [[ -n "${existing}" ]]; then
+            gh issue edit "${existing}" --repo "${{ github.repository }}" --body-file "${body_file}"
+            gh issue comment "${existing}" --repo "${{ github.repository }}" \
+              --body "Still failing as of ${RUN_URL}."
+          else
+            gh issue create --repo "${{ github.repository }}" --title "${title}" \
+              --label drift-check-error --body-file "${body_file}"
+          fi
+
+      - name: Close drift-check-error issue if resolved
+        if: steps.plan.outputs.exitcode == '0' || steps.plan.outputs.exitcode == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX_ENVIRONMENT: ${{ matrix.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Drift check failed: ${MATRIX_ENVIRONMENT}"
+          existing=$(gh issue list --repo "${{ github.repository }}" --label drift-check-error --state open \
+            --search "in:title \"${title}\"" --json number --jq '.[0].number')
+
+          if [[ -n "${existing}" ]]; then
+            gh issue comment "${existing}" --repo "${{ github.repository }}" \
+              --body "Resolved — drift check ran successfully (produced a real verdict) as of ${RUN_URL}."
+            gh issue close "${existing}" --repo "${{ github.repository }}"
+          fi
+
+      - name: Fail if drift or check error detected
+        if: steps.plan.outputs.exitcode == '2' || steps.plan.outputs.exitcode == '1'
+        run: |
+          if [[ "${{ steps.plan.outputs.exitcode }}" == "2" ]]; then
+            echo "Drift detected in ${{ matrix.environment }} — see step summary / tracking issue."
+          else
+            echo "Drift check errored in ${{ matrix.environment }} (terraform plan failed, exit 1) — see step summary / tracking issue."
+          fi
+          exit 1

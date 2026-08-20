@@ -1,0 +1,211 @@
+name: Terraform Destroy
+
+# Manual only, and more dangerous than Apply — this deletes everything currently in an
+# environment's state. `confirm-intent` fails fast on a typed-confirmation mismatch before any
+# AWS auth happens, then destroy -> approve -> destroy follows the same shape as
+# terraform-apply.yml (see ADR-0009): the saved destroy plan is what gets applied, never a
+# fresh re-plan, so what a reviewer approves is exactly what runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to destroy"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirm_environment:
+        description: "Type the environment name exactly to confirm you intend to DESTROY all deployed infrastructure in it"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  # No `environment:` key here on purpose — this must not be gate-able by a reviewer rule and
+  # must not need OIDC. It exists purely to kill a mistyped confirmation before anything else
+  # in this workflow touches AWS or asks anyone to approve anything.
+  confirm-intent:
+    name: Verify destroy confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation matches target environment
+        run: |
+          if [[ "${{ inputs.confirm_environment }}" != "${{ inputs.environment }}" ]]; then
+            echo "::error::Typed confirmation '${{ inputs.confirm_environment }}' does not match target environment '${{ inputs.environment }}'. Aborting before any AWS authentication."
+            exit 1
+          fi
+          echo "Confirmed: about to plan a DESTROY of environments/${{ inputs.environment }}."
+
+  plan:
+    name: Plan (${{ inputs.environment }})
+    needs: confirm-intent
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: environments/${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
+            -backend-config="kms_key_id=${{ vars.TF_STATE_KMS_KEY_ARN }}"
+
+      - name: Terraform Plan (destroy)
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -destroy -out=tfplan-destroy -no-color 2>&1 | tee plan-output.txt
+        env:
+          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+          TF_VAR_environment: ${{ inputs.environment }}
+          TF_VAR_cost_center: ${{ vars.COST_CENTER }}
+          TF_VAR_data_classification: ${{ vars.DATA_CLASSIFICATION }}
+          TF_VAR_owner: ${{ vars.OWNER }}
+          TF_VAR_retention_policy: ${{ vars.RETENTION_POLICY }}
+          # JSON list of role ARN(s) allowed to administer this platform's KMS CMKs (rotate,
+          # rewrite key policy, schedule/cancel deletion) — set by bootstrap-env.sh from
+          # bootstrap/'s kms_admin_role_arn output. See ADR-0013 and docs/deployment.md.
+          # || '[]' matches the variable's own Terraform default (variables.tf) — needed
+          # because an unset GitHub Environment variable resolves to "" here, and Terraform
+          # fails trying to HCL-parse an empty string as a list(string), not "use the default".
+          TF_VAR_kms_admin_role_arns: ${{ vars.KMS_ADMIN_ROLE_ARNS || '[]' }}
+          TF_VAR_network_shared_vpc_cidr: ${{ vars.NETWORK_SHARED_VPC_CIDR }}
+          TF_VAR_network_shared_private_subnet_cidrs: ${{ vars.NETWORK_SHARED_PRIVATE_SUBNET_CIDRS }}
+          TF_VAR_integration_vpc_cidr: ${{ vars.INTEGRATION_VPC_CIDR }}
+          TF_VAR_integration_private_subnet_cidrs: ${{ vars.INTEGRATION_PRIVATE_SUBNET_CIDRS }}
+          TF_VAR_nrt_processing_vpc_cidr: ${{ vars.NRT_PROCESSING_VPC_CIDR }}
+          TF_VAR_nrt_processing_private_subnet_cidrs: ${{ vars.NRT_PROCESSING_PRIVATE_SUBNET_CIDRS }}
+          TF_VAR_data_vpc_cidr: ${{ vars.DATA_VPC_CIDR }}
+          TF_VAR_data_private_subnet_cidrs: ${{ vars.DATA_PRIVATE_SUBNET_CIDRS }}
+          TF_VAR_enable_dx: "false"
+          TF_VAR_enable_vpn: "false"
+          # MSK/Flink/Redis/lakehouse sizing — || falls back to the same default already in
+          # variables.tf, so this stays safe even if bootstrap-env.sh hasn't been rerun since
+          # these were added (an unset GitHub Environment variable resolves to "" here, which
+          # would otherwise flow through as an explicit empty string, not "use the default").
+          TF_VAR_msk_kafka_version: ${{ vars.MSK_KAFKA_VERSION || '3.9.x' }}
+          TF_VAR_msk_number_of_broker_nodes: ${{ vars.MSK_NUMBER_OF_BROKER_NODES || '4' }}
+          TF_VAR_msk_broker_instance_type: ${{ vars.MSK_BROKER_INSTANCE_TYPE || 'kafka.m5.large' }}
+          TF_VAR_msk_broker_ebs_volume_size: ${{ vars.MSK_BROKER_EBS_VOLUME_SIZE || '100' }}
+          TF_VAR_flink_application_jar_s3_key: ${{ vars.FLINK_APPLICATION_JAR_S3_KEY || 'flink-jobs/bootstrap-noop.jar' }}
+          TF_VAR_flink_parallelism: ${{ vars.FLINK_PARALLELISM || '2' }}
+          TF_VAR_redis_node_type: ${{ vars.REDIS_NODE_TYPE || 'cache.r7g.large' }}
+          TF_VAR_redis_num_cache_clusters: ${{ vars.REDIS_NUM_CACHE_CLUSTERS || '2' }}
+          TF_VAR_ods_retention_days: ${{ vars.ODS_RETENTION_DAYS || '7' }}
+          TF_VAR_enable_decisioning_in_platform: ${{ vars.ENABLE_DECISIONING_IN_PLATFORM || 'false' }}
+          TF_VAR_ses_domain: ${{ vars.SES_DOMAIN }}
+          # No sensible fallback for these two — a real, unique bucket name and a real JAR
+          # location can't be invented. Left unset, Terraform will fail loudly rather than
+          # silently apply against a placeholder value (see modules/lakehouse, modules/flink-emr).
+          TF_VAR_lakehouse_bucket_name: ${{ vars.LAKEHOUSE_BUCKET_NAME }}
+          TF_VAR_flink_application_jar_s3_bucket_arn: ${{ vars.FLINK_APPLICATION_JAR_S3_BUCKET_ARN }}
+
+      - name: Upload destroy plan artifact (audit trail + destroy input)
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-destroy-${{ inputs.environment }}
+          path: |
+            environments/${{ inputs.environment }}/tfplan-destroy
+            environments/${{ inputs.environment }}/plan-output.txt
+          retention-days: 90
+
+      - name: Post plan to step summary
+        if: always()
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        run: |
+          STATUS_ICON=$([[ "${PLAN_OUTCOME}" == "success" ]] && echo "🔥" || echo "❌")
+          {
+            echo "## ${STATUS_ICON} Terraform DESTROY Plan: \`${{ inputs.environment }}\`"
+            echo ""
+            echo "> **This permanently deletes every resource currently in \`${{ inputs.environment }}\`'s state.**"
+            echo "> Review this output carefully, then approve the **Manual Approval** job below to proceed."
+            echo ""
+            echo "<details><summary>Show plan</summary>"
+            echo ""
+            echo '```hcl'
+            cat plan-output.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Exists purely to trip this environment's protection rule (required reviewers), if any,
+  # after the destroy plan above is visible. Same pattern as terraform-apply.yml.
+  approve:
+    name: Manual Approval (${{ inputs.environment }})
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - run: echo "Approved — proceeding with destroy."
+
+  destroy:
+    name: Destroy (${{ inputs.environment }})
+    needs: approve
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: environments/${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
+            -backend-config="kms_key_id=${{ vars.TF_STATE_KMS_KEY_ARN }}"
+
+      - name: Download destroy plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-destroy-${{ inputs.environment }}
+          path: environments/${{ inputs.environment }}
+
+      - name: Terraform Destroy
+        # Applying a saved destroy plan does not prompt and cannot drift from what was
+        # reviewed above — the plan file itself is the approval.
+        run: terraform apply -no-color tfplan-destroy
