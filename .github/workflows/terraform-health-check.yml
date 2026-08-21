@@ -14,8 +14,8 @@ name: Operational Health Check
 # this workflow needs on that environment.
 
 on:
-  schedule:
-    - cron: "0 */4 * * *"
+  #schedule:
+  #  - cron: "0 */4 * * *"
   workflow_dispatch:
     inputs:
       environment:
