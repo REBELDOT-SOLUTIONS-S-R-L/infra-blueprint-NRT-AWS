@@ -11,8 +11,8 @@ name: Terraform Drift Detect
 # same deploy role (bootstrap/'s trust policy lists both subjects).
 
 on:
-  schedule:
-    - cron: "0 6 * * *"
+  #schedule:
+  #  - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       environment:
